@@ -6,7 +6,7 @@
  * basado en el peso y, opcionalmente, en el tipo de envasado (granel/individual).
  *
  * @author   josra
- * @version  1.1.2
+ * @version  1.1.3
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -14,6 +14,7 @@ if (!defined('_PS_VERSION_')) {
 }
 
 require_once dirname(__FILE__) . '/classes/CombinacionesCarneModel.php';
+require_once dirname(__FILE__) . '/classes/CombinacionescarneUpdater.php';
 
 class CombinacionesCarne extends Module
 {
@@ -21,7 +22,7 @@ class CombinacionesCarne extends Module
     {
         $this->name = 'combinacionescarne';
         $this->tab = 'pricing_promotion';
-        $this->version = '1.1.2';
+        $this->version = '1.1.3';
         $this->author = 'josra';
         $this->need_instance = 0;
         $this->bootstrap = true;
@@ -35,6 +36,23 @@ class CombinacionesCarne extends Module
         $this->displayName = $this->l('Combinaciones Automáticas para Carne');
         $this->description = $this->l('Automatiza el cálculo de precios para combinaciones de productos cárnicos.');
         $this->confirmUninstall = $this->l('¿Estás seguro que quieres desinstalar este módulo?');
+    }
+
+    public function getUpdater()
+    {
+        return new CombinacionescarneUpdater($this);
+    }
+
+    /** Aviso periódico al servidor de actualizaciones (solo en el back-office) */
+    public function hookActionAdminControllerSetMedia($params)
+    {
+        $this->getUpdater()->maybePing();
+    }
+
+    /** PS 8.1+: la versión nueva aparece en Gestor de módulos > Actualizaciones */
+    public function hookActionListModules($params)
+    {
+        return $this->getUpdater()->getNativeModuleList();
     }
 
     /**
@@ -74,7 +92,8 @@ class CombinacionesCarne extends Module
             $this->registerHook('actionProductAttributeAdd') &&
             $this->registerHook('actionProductSave') &&
             $this->registerHook('actionProductDelete') &&
-            $this->registerHook('displayBackOfficeHeader');
+            $this->registerHook('displayBackOfficeHeader') &&
+            $this->getUpdater()->registerHooks();
     }
 
     /**
@@ -82,6 +101,11 @@ class CombinacionesCarne extends Module
      */
     public function uninstall()
     {
+        $this->getUpdater()->notifyUninstall();
+        Configuration::deleteByName('COMBINACIONESCARNE_UPD_TS');
+        Configuration::deleteByName('COMBINACIONESCARNE_UPD_INFO');
+        Configuration::deleteByName('COMBINACIONESCARNE_UPD_SU');
+        Configuration::deleteByName('COMBINACIONESCARNE_UPD_LT');
         Configuration::deleteByName('COMBINACIONESCARNE_PRECIO_INDIVIDUAL');
         Configuration::deleteByName('COMBINACIONESCARNE_GRUPO_ENVASADO');
         Configuration::deleteByName('COMBINACIONESCARNE_ATRIBUTO_GRANEL');
@@ -122,7 +146,9 @@ class CombinacionesCarne extends Module
      */
     public function getContent()
     {
-        $output = '';
+        // Servidor de actualizaciones: botones del panel, hooks y upgrades pendientes
+        $updater = $this->getUpdater();
+        $output = $updater->processRequest();
         $errors = array();
         $success = false;
 
@@ -214,18 +240,24 @@ class CombinacionesCarne extends Module
             }
         }
 
-        $output .= $this->renderNavTabs($action);
+        $forms = $this->renderNavTabs($action);
 
         if ($action == 'mapeos') {
-            $output .= $this->renderMapeoPesoConfig();
+            $forms .= $this->renderMapeoPesoConfig();
         } elseif ($action == 'product' && $id_product > 0) {
-            $output .= $this->renderProductConfiguration($id_product);
+            $forms .= $this->renderProductConfiguration($id_product);
         } else {
-            $output .= $this->renderGeneralConfig();
-            $output .= $this->renderProductSelector();
+            $forms .= $this->renderGeneralConfig();
+            $forms .= $this->renderProductSelector();
         }
 
-        return $output;
+        // Panel de actualizaciones: arriba si hay versión nueva, abajo si no
+        $info = $updater->getInfo();
+        $panel = $updater->renderPanel();
+
+        return !empty($info['update_available'])
+            ? $output . $panel . $forms
+            : $output . $forms . $panel;
     }
 
     /**
