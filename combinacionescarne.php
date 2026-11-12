@@ -1,19 +1,18 @@
 <?php
 /**
- * Módulo CombinacionesCarne - Versión para PrestaShop 8
- * 
+ * Módulo CombinacionesCarne
+ *
  * Automatiza el cálculo de precios para combinaciones de productos cárnicos
- * basado en tipo de envasado y peso
- * 
- * @author   Claude AI
- * @version  1.0.2
+ * basado en el peso y, opcionalmente, en el tipo de envasado (granel/individual).
+ *
+ * @author   josra
+ * @version  1.1.2
  */
 
 if (!defined('_PS_VERSION_')) {
     exit;
 }
 
-// Incluimos el modelo correctamente
 require_once dirname(__FILE__) . '/classes/CombinacionesCarneModel.php';
 
 class CombinacionesCarne extends Module
@@ -22,14 +21,14 @@ class CombinacionesCarne extends Module
     {
         $this->name = 'combinacionescarne';
         $this->tab = 'pricing_promotion';
-        $this->version = '1.0.2';
-        $this->author = 'Claude AI';
+        $this->version = '1.1.2';
+        $this->author = 'josra';
         $this->need_instance = 0;
         $this->bootstrap = true;
-        $this->ps_versions_compliancy = [
+        $this->ps_versions_compliancy = array(
             'min' => '1.7',
-            'max' => _PS_VERSION_
-        ];
+            'max' => _PS_VERSION_,
+        );
 
         parent::__construct();
 
@@ -43,14 +42,12 @@ class CombinacionesCarne extends Module
      */
     public function install()
     {
-        // Configuraciones por defecto
         Configuration::updateValue('COMBINACIONESCARNE_PRECIO_INDIVIDUAL', 1.5);
         Configuration::updateValue('COMBINACIONESCARNE_GRUPO_ENVASADO', 0);
         Configuration::updateValue('COMBINACIONESCARNE_ATRIBUTO_GRANEL', 0);
         Configuration::updateValue('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL', 0);
         Configuration::updateValue('COMBINACIONESCARNE_GRUPO_PESO', 0);
-        
-        // Creamos la tabla para guardar la configuración por producto
+
         $sql = "CREATE TABLE IF NOT EXISTS `" . _DB_PREFIX_ . "combinacionescarne_product` (
             `id_product` INT(10) UNSIGNED NOT NULL,
             `precio_por_kilo` DECIMAL(20,6) NOT NULL DEFAULT '0.000000',
@@ -61,15 +58,13 @@ class CombinacionesCarne extends Module
             `active` TINYINT(1) UNSIGNED NOT NULL DEFAULT '1',
             PRIMARY KEY (`id_product`)
         ) ENGINE=" . _MYSQL_ENGINE_ . " DEFAULT CHARSET=utf8mb4;";
-        
-        // Creamos la tabla para el mapeo de pesos (cambiando peso_kg a peso_gramos)
+
         $sql2 = "CREATE TABLE IF NOT EXISTS `" . _DB_PREFIX_ . "combinacionescarne_peso_map` (
             `id_attribute` INT(10) UNSIGNED NOT NULL,
             `peso_gramos` INT(10) UNSIGNED NOT NULL DEFAULT '0',
             PRIMARY KEY (`id_attribute`)
         ) ENGINE=" . _MYSQL_ENGINE_ . " DEFAULT CHARSET=utf8mb4;";
-        
-        // Registramos los hooks para actualizar productos y combinaciones
+
         return parent::install() &&
             Db::getInstance()->execute($sql) &&
             Db::getInstance()->execute($sql2) &&
@@ -88,11 +83,22 @@ class CombinacionesCarne extends Module
     public function uninstall()
     {
         Configuration::deleteByName('COMBINACIONESCARNE_PRECIO_INDIVIDUAL');
-        
-        // Eliminamos las tablas
+        Configuration::deleteByName('COMBINACIONESCARNE_GRUPO_ENVASADO');
+        Configuration::deleteByName('COMBINACIONESCARNE_ATRIBUTO_GRANEL');
+        Configuration::deleteByName('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL');
+        Configuration::deleteByName('COMBINACIONESCARNE_GRUPO_PESO');
+
         $sql = "DROP TABLE IF EXISTS `" . _DB_PREFIX_ . "combinacionescarne_product`;";
         $sql2 = "DROP TABLE IF EXISTS `" . _DB_PREFIX_ . "combinacionescarne_peso_map`;";
-        
+
+        // Limpieza de logs (de esta versión y de versiones anteriores)
+        foreach (array('combinacionescarne.log', 'log.txt', 'auto_log.txt', 'single_update_log.txt') as $log_file) {
+            $path = _PS_MODULE_DIR_ . 'combinacionescarne/' . $log_file;
+            if (file_exists($path)) {
+                @unlink($path);
+            }
+        }
+
         return parent::uninstall() &&
             Db::getInstance()->execute($sql) &&
             Db::getInstance()->execute($sql2);
@@ -104,33 +110,10 @@ class CombinacionesCarne extends Module
     public function hookDisplayBackOfficeHeader()
     {
         $controller_name = $this->context->controller->controller_name;
-        
+
         if ($controller_name == 'AdminModules' && Tools::getValue('configure') == $this->name) {
             $this->context->controller->addJS($this->_path . 'views/js/admin.js');
             $this->context->controller->addCSS($this->_path . 'views/css/admin.css');
-            
-            // Agregar variables JavaScript para traducciones y URLs
-            Media::addJsDef([
-                'combinacionescarne' => [
-                    'ajax_url' => $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name . '&ajax=1',
-                    'token' => Tools::getAdminTokenLite('AdminModules'),
-                    'product_id' => (int)Tools::getValue('id_product', 0),
-                    'i18n' => [
-                        'error' => $this->l('Error'),
-                        'success' => $this->l('Éxito'),
-                        'updating' => $this->l('Actualizando...'),
-                        'calculating' => $this->l('Calculando...'),
-                        'selectAttribute' => $this->l('Por favor, seleccione un atributo'),
-                        'invalidWeight' => $this->l('El peso debe ser un número positivo'),
-                        'selectEnvasadoGroup' => $this->l('Seleccione un grupo de atributos para envasado'),
-                        'selectGranelAttribute' => $this->l('Seleccione un atributo para envasado a granel'),
-                        'selectIndividualAttribute' => $this->l('Seleccione un atributo para envasado individual'),
-                        'selectPesoGroup' => $this->l('Seleccione un grupo de atributos para peso'),
-                        'editWeightMapping' => $this->l('Editar Mapeo de Peso'),
-                        'addNewWeightMapping' => $this->l('Añadir Nuevo Mapeo de Peso')
-                    ]
-                ]
-            ]);
         }
     }
 
@@ -140,46 +123,37 @@ class CombinacionesCarne extends Module
     public function getContent()
     {
         $output = '';
-        $errors = [];
+        $errors = array();
         $success = false;
-        
-        // Identificamos la acción solicitada
+
         $action = Tools::getValue('action', 'general');
         $id_product = (int) Tools::getValue('id_product', 0);
-        
-        // Procesamiento AJAX
-        if (Tools::getValue('ajax') == 1) {
-            return $this->processAjaxRequests();
-        }
-        
-        // Procesamiento del formulario de configuración general
+
+        // Configuración general
         if (Tools::isSubmit('submit' . $this->name)) {
             $precio_individual = (float) Tools::getValue('COMBINACIONESCARNE_PRECIO_INDIVIDUAL');
-            
+
             if ($precio_individual < 0) {
                 $errors[] = $this->l('El valor del precio de envasado individual debe ser positivo.');
             } else {
-                // Guardamos el precio de envasado individual
                 Configuration::updateValue('COMBINACIONESCARNE_PRECIO_INDIVIDUAL', $precio_individual);
-                
-                // Guardamos los grupos de atributos globales
                 Configuration::updateValue('COMBINACIONESCARNE_GRUPO_ENVASADO', (int) Tools::getValue('COMBINACIONESCARNE_GRUPO_ENVASADO', 0));
                 Configuration::updateValue('COMBINACIONESCARNE_ATRIBUTO_GRANEL', (int) Tools::getValue('COMBINACIONESCARNE_ATRIBUTO_GRANEL', 0));
                 Configuration::updateValue('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL', (int) Tools::getValue('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL', 0));
                 Configuration::updateValue('COMBINACIONESCARNE_GRUPO_PESO', (int) Tools::getValue('COMBINACIONESCARNE_GRUPO_PESO', 0));
-                
+
                 $success = true;
             }
         }
-        
-        // Procesamiento del formulario de gestión de mapeos
+
+        // Mapeos de peso
         if (Tools::isSubmit('submitMapeoPeso')) {
             $id_attribute = (int) Tools::getValue('id_attribute');
             $peso_gramos = (int) Tools::getValue('peso_gramos');
-            
+
             if ($id_attribute <= 0) {
                 $errors[] = $this->l('Por favor, seleccione un atributo válido.');
-            } else if ($peso_gramos <= 0) {
+            } elseif ($peso_gramos <= 0) {
                 $errors[] = $this->l('El peso debe ser un valor positivo.');
             } else {
                 if (CombinacionesCarneModel::savePesoMapeo($id_attribute, $peso_gramos)) {
@@ -189,11 +163,10 @@ class CombinacionesCarne extends Module
                 }
             }
         }
-        
-        // Procesamiento de eliminación de mapeo
+
         if (Tools::isSubmit('deleteMapeoPeso')) {
             $id_attribute = (int) Tools::getValue('id_attribute');
-            
+
             if ($id_attribute > 0) {
                 if (CombinacionesCarneModel::deletePesoMapeo($id_attribute)) {
                     $success = true;
@@ -202,505 +175,227 @@ class CombinacionesCarne extends Module
                 }
             }
         }
-        
-        // Procesamiento del formulario de configuración de producto
+
+        // Configuración/cálculo manual por producto (cuando se entra al módulo)
         if (Tools::isSubmit('submitProductConfig') || Tools::isSubmit('submitCalculate')) {
             $id_product = (int) Tools::getValue('id_product');
-            
+
             if ($id_product <= 0) {
                 $errors[] = $this->l('Por favor, seleccione un producto válido.');
             } else {
-                $active = (int) Tools::getValue('active', 1); // Default a 1 (activado)
-                $override_global_config = (int) Tools::getValue('override_global_config', 0);
-                
-                // Obtenemos los valores globales para usar como valores predeterminados
-                $id_attribute_group_envasado = (int) Configuration::get('COMBINACIONESCARNE_GRUPO_ENVASADO');
-                $id_attribute_envasado_granel = (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_GRANEL');
-                $id_attribute_envasado_individual = (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL');
-                $id_attribute_group_peso = (int) Configuration::get('COMBINACIONESCARNE_GRUPO_PESO');
-                
-                // Si se enviaron valores específicos para el producto, los usamos
-                if ($override_global_config) {
-                    $id_attribute_group_envasado = (int) Tools::getValue('id_attribute_group_envasado', $id_attribute_group_envasado);
-                    $id_attribute_envasado_granel = (int) Tools::getValue('id_attribute_envasado_granel', $id_attribute_envasado_granel);
-                    $id_attribute_envasado_individual = (int) Tools::getValue('id_attribute_envasado_individual', $id_attribute_envasado_individual);
-                    $id_attribute_group_peso = (int) Tools::getValue('id_attribute_group_peso', $id_attribute_group_peso);
-                }
-                
-                // Preparamos los datos
                 $config = array(
-                    'precio_por_kilo' => 0, // Ya no usamos este campo
-                    'id_attribute_group_envasado' => $id_attribute_group_envasado,
-                    'id_attribute_envasado_granel' => $id_attribute_envasado_granel,
-                    'id_attribute_envasado_individual' => $id_attribute_envasado_individual,
-                    'id_attribute_group_peso' => $id_attribute_group_peso,
-                    'active' => $active
+                    'precio_por_kilo' => 0,
+                    'id_attribute_group_envasado' => (int) Configuration::get('COMBINACIONESCARNE_GRUPO_ENVASADO'),
+                    'id_attribute_envasado_granel' => (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_GRANEL'),
+                    'id_attribute_envasado_individual' => (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL'),
+                    'id_attribute_group_peso' => (int) Configuration::get('COMBINACIONESCARNE_GRUPO_PESO'),
+                    'active' => 1,
                 );
-                
-                // Guardamos la configuración
+
                 if (CombinacionesCarneModel::saveProductConfig($id_product, $config)) {
-                    // Si se solicitó, calculamos los precios
-                    if (Tools::isSubmit('submitCalculate')) {
-                        if (CombinacionesCarneModel::updateCombinationPrices($id_product)) {
-                            $success = true;
-                        } else {
-                            $errors[] = $this->l('Error al calcular los precios de las combinaciones.');
-                        }
-                    } else {
+                    if (CombinacionesCarneModel::updateCombinationPrices($id_product)) {
                         $success = true;
+                    } else {
+                        $errors[] = $this->l('No se ha calculado ninguna combinación: revisa que tengan un atributo de peso mapeado en gramos.');
                     }
                 } else {
                     $errors[] = $this->l('Error al guardar la configuración del producto.');
                 }
             }
         }
-        
-        // Asignar variables comunes a todas las vistas
-        $this->context->smarty->assign([
-            'module_path' => $this->_path,
-            'module_version' => $this->version,
-            'current_action' => $action,
-            'current_url' => $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name,
-            'module_confirmation' => $success ? $this->l('Configuración actualizada correctamente.') : null,
-            'module_errors' => !empty($errors) ? $errors : [],
-        ]);
-        
-        // Renderizar navegación común
-        $navigation = $this->context->smarty->fetch($this->local_path . 'views/templates/admin/navigation.tpl');
-        
-        // Cargamos la sección correspondiente según la acción
+
+        if ($success) {
+            $output .= $this->displayConfirmation($this->l('Configuración actualizada correctamente.'));
+        }
+
+        if (!empty($errors)) {
+            foreach ($errors as $error) {
+                $output .= $this->displayError($error);
+            }
+        }
+
+        $output .= $this->renderNavTabs($action);
+
         if ($action == 'mapeos') {
-            return $navigation . $this->renderMapeoPesoConfig();
-        } else if ($action == 'product' && $id_product > 0) {
-            // Añadir nombre del producto para la navegación
-            $product = new Product($id_product, false, $this->context->language->id);
-            if (Validate::isLoadedObject($product)) {
-                $this->context->smarty->assign('product_name', $product->name);
-            }
-            
-            // Re-renderizar navegación con el nombre del producto
-            $navigation = $this->context->smarty->fetch($this->local_path . 'views/templates/admin/navigation.tpl');
-            
-            return $navigation . $this->renderProductConfiguration($id_product);
+            $output .= $this->renderMapeoPesoConfig();
+        } elseif ($action == 'product' && $id_product > 0) {
+            $output .= $this->renderProductConfiguration($id_product);
         } else {
-            // Sección principal con visión general
-            return $navigation . $this->renderGeneralConfig();
+            $output .= $this->renderGeneralConfig();
+            $output .= $this->renderProductSelector();
         }
+
+        return $output;
     }
 
     /**
-     * Procesa peticiones AJAX
+     * Renderiza las pestañas de navegación
      */
-    private function processAjaxRequests()
+    protected function renderNavTabs($current_action)
     {
-        header('Content-Type: application/json');
-        
-        $action = Tools::getValue('action');
-        $id_product = (int) Tools::getValue('id_product', 0);
-        $response = ['success' => false, 'message' => ''];
-        
-        if ($action == 'calculatePrices' && $id_product > 0) {
-            try {
-                $result = CombinacionesCarneModel::updateCombinationPrices($id_product);
-                if ($result) {
-                    $response = [
-                        'success' => true,
-                        'message' => $this->l('Precios actualizados correctamente')
-                    ];
-                } else {
-                    $response = [
-                        'success' => false,
-                        'message' => $this->l('No fue necesario actualizar los precios. Ya están correctos.')
-                    ];
+        $html = '<div class="panel-heading">';
+        $html .= '<ul class="nav nav-tabs">';
+
+        $activeClass = ($current_action == 'general') ? 'active' : '';
+        $html .= '<li class="nav-item ' . $activeClass . '">';
+        $html .= '<a href="' . $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name . '" class="nav-link ' . $activeClass . '">';
+        $html .= '<i class="icon-cog"></i> ' . $this->l('Configuración General');
+        $html .= '</a>';
+        $html .= '</li>';
+
+        $activeClass = ($current_action == 'mapeos') ? 'active' : '';
+        $html .= '<li class="nav-item ' . $activeClass . '">';
+        $html .= '<a href="' . $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name . '&action=mapeos" class="nav-link ' . $activeClass . '">';
+        $html .= '<i class="icon-balance-scale"></i> ' . $this->l('Mapeo de Pesos');
+        $html .= '</a>';
+        $html .= '</li>';
+
+        if ($current_action == 'product') {
+            $id_product = (int) Tools::getValue('id_product', 0);
+            if ($id_product > 0) {
+                $product = new Product($id_product, false, $this->context->language->id);
+                if (Validate::isLoadedObject($product)) {
+                    $html .= '<li class="nav-item active">';
+                    $html .= '<a href="#" class="nav-link active">';
+                    $html .= '<i class="icon-tag"></i> ' . $product->name;
+                    $html .= '</a>';
+                    $html .= '</li>';
                 }
-            } catch (Exception $e) {
-                $response = [
-                    'success' => false,
-                    'message' => $this->l('Error al actualizar los precios') . ': ' . $e->getMessage()
-                ];
-            }
-        } elseif ($action == 'updateCombination') {
-            $id_product_attribute = (int) Tools::getValue('id_product_attribute', 0);
-            
-            if ($id_product > 0 && $id_product_attribute > 0) {
-                try {
-                    $result = CombinacionesCarneModel::updateCombinationPrice($id_product, $id_product_attribute);
-                    if ($result) {
-                        $response = [
-                            'success' => true,
-                            'message' => $this->l('Combinación actualizada correctamente')
-                        ];
-                    } else {
-                        $response = [
-                            'success' => false,
-                            'message' => $this->l('No fue necesario actualizar la combinación. Ya está correcta.')
-                        ];
-                    }
-                } catch (Exception $e) {
-                    $response = [
-                        'success' => false,
-                        'message' => $this->l('Error al actualizar la combinación') . ': ' . $e->getMessage()
-                    ];
-                }
-            } else {
-                $response = [
-                    'success' => false,
-                    'message' => $this->l('ID de producto o combinación no válido')
-                ];
-            }
-        } elseif ($action == 'checkCombinationNeedsUpdate') {
-            $id_product_attribute = (int) Tools::getValue('id_product_attribute', 0);
-            
-            if ($id_product > 0 && $id_product_attribute > 0) {
-                try {
-                    $needsUpdate = CombinacionesCarneModel::combinationNeedsUpdate($id_product, $id_product_attribute);
-                    $response = [
-                        'success' => true,
-                        'needsUpdate' => $needsUpdate
-                    ];
-                } catch (Exception $e) {
-                    $response = [
-                        'success' => false,
-                        'message' => $this->l('Error al comprobar la combinación') . ': ' . $e->getMessage()
-                    ];
-                }
-            } else {
-                $response = [
-                    'success' => false,
-                    'message' => $this->l('ID de producto o combinación no válido')
-                ];
             }
         }
-        
-        return json_encode($response);
+
+        $html .= '</ul>';
+        $html .= '</div>';
+
+        return $html;
     }
 
     /**
-     * Renderiza la página principal con configuración general
+     * Renderiza el formulario de configuración general
      */
     protected function renderGeneralConfig()
     {
-        // Obtener estadísticas para el panel de información
-        $productCount = Db::getInstance()->getValue(
-            "SELECT COUNT(*) FROM `" . _DB_PREFIX_ . "combinacionescarne_product` WHERE active = 1"
-        );
-        
-        $combinationsCount = 0;
-        $productIds = Db::getInstance()->executeS(
-            "SELECT id_product FROM `" . _DB_PREFIX_ . "combinacionescarne_product` WHERE active = 1"
-        );
-        
-        if (!empty($productIds)) {
-            $productIdsList = array_column($productIds, 'id_product');
-            $combinationsCount = Db::getInstance()->getValue(
-                "SELECT COUNT(*) FROM `" . _DB_PREFIX_ . "product_attribute` 
-                 WHERE id_product IN (" . implode(',', array_map('intval', $productIdsList)) . ")"
-            );
-        }
-        
-        $mappingsCount = Db::getInstance()->getValue(
-            "SELECT COUNT(*) FROM `" . _DB_PREFIX_ . "combinacionescarne_peso_map`"
-        );
-        
-        $packagingPrice = (float) Configuration::get('COMBINACIONESCARNE_PRECIO_INDIVIDUAL');
-        
-        // Obtener productos con combinaciones
-        $products = $this->getProductsWithCombinations();
-        foreach ($products as &$product) {
-            $config = CombinacionesCarneModel::getProductConfig($product['id_product']);
-            $product['config_active'] = $config['active'];
-        }
-        
-        // Obtener grupos de atributos y sus valores
         $attribute_groups = $this->getAttributeGroupsWithValues();
-        
-        // Asignar variables a la plantilla
-        $this->context->smarty->assign([
-            'productCount' => $productCount,
-            'combinationsCount' => $combinationsCount,
-            'mappingsCount' => $mappingsCount,
-            'packagingPrice' => $packagingPrice,
-            'products' => $products,
-            'attribute_groups' => $attribute_groups,
-            'config_values' => $this->getConfigFormValues(),
-        ]);
-        
-        // Renderizar la plantilla
-        return $this->context->smarty->fetch($this->local_path . 'views/templates/admin/overview.tpl');
+
+        $helper = new HelperForm();
+
+        $helper->show_toolbar = false;
+        $helper->table = $this->table;
+        $helper->module = $this;
+        $helper->default_form_language = $this->context->language->id;
+        $helper->allow_employee_form_lang = Configuration::get('PS_BO_ALLOW_EMPLOYEE_FORM_LANG', 0);
+
+        $helper->identifier = $this->identifier;
+        $helper->submit_action = 'submit' . $this->name;
+        $helper->currentIndex = $this->context->link->getAdminLink('AdminModules', false)
+            . '&configure=' . $this->name . '&tab_module=' . $this->tab . '&module_name=' . $this->name;
+        $helper->token = Tools::getAdminTokenLite('AdminModules');
+
+        $helper->tpl_vars = array(
+            'fields_value' => $this->getConfigFormValues(),
+            'languages' => $this->context->controller->getLanguages(),
+            'id_language' => $this->context->language->id,
+        );
+
+        return '<div class="panel"><div class="panel-heading"><i class="icon-cogs"></i> ' .
+               $this->l('Configuración General') . '</div>' .
+               $helper->generateForm(array($this->getConfigForm($attribute_groups))) .
+               '</div>';
     }
 
     /**
-     * Renderiza la sección de mapeo de pesos
+     * Estructura del formulario de configuración general
      */
-    protected function renderMapeoPesoConfig()
+    protected function getConfigForm($attribute_groups)
     {
-        // Obtener todos los grupos de atributos con sus valores
-        $attribute_groups = $this->getAttributeGroupsWithValues();
-        
-        // Obtener mapeos existentes
-        $mapeos_detallados = CombinacionesCarneModel::getPesoMapeosDetallados();
-        
-        // Asignar variables a la plantilla
-        $this->context->smarty->assign([
-            'attribute_groups' => $attribute_groups,
-            'mapeos_detallados' => $mapeos_detallados,
-            'current_url' => $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name . '&action=mapeos',
-        ]);
-        
-        // Renderizar la plantilla
-        return $this->context->smarty->fetch($this->local_path . 'views/templates/admin/weight_mapping.tpl');
-    }
+        $groups_options = array(
+            array('id_option' => 0, 'name' => $this->l('-- Seleccionar --')),
+        );
 
-/**
- * Renderiza la configuración para un producto específico
- */
-protected function renderProductConfiguration($id_product)
-{
-    // Obtener datos del producto
-    $product = new Product($id_product, false, $this->context->language->id);
-    
-    if (!Validate::isLoadedObject($product)) {
-        return $this->l('Producto no válido');
-    }
-    
-    // Obtener configuración guardada
-    $product_config = CombinacionesCarneModel::getProductConfig($id_product);
-    
-    // Determinar si se usa configuración personalizada
-    $product_config['override_global'] = false;
-    if ($product_config['id_attribute_group_envasado'] != (int) Configuration::get('COMBINACIONESCARNE_GRUPO_ENVASADO') ||
-        $product_config['id_attribute_envasado_granel'] != (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_GRANEL') ||
-        $product_config['id_attribute_envasado_individual'] != (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL') ||
-        $product_config['id_attribute_group_peso'] != (int) Configuration::get('COMBINACIONESCARNE_GRUPO_PESO')) {
-        $product_config['override_global'] = false;
-    }
-    
-    // Obtener precio base del producto y precio de envasado individual
-    $tax_rate = CombinacionesCarneModel::getTaxRate($id_product);
-$tax_multiplier = 1 + ($tax_rate / 100);
-$precio_base_producto = $product->price * $tax_multiplier;
-    $precio_individual = (float) Configuration::get('COMBINACIONESCARNE_PRECIO_INDIVIDUAL');
-    
-    // Obtener grupos de atributos y sus valores
-    $attribute_groups = $this->getAttributeGroupsWithValues();
-    
-    // Obtener atributos específicos para envasado
-    $envasado_attributes = [];
-    foreach ($attribute_groups as $group) {
-        foreach ($group['attributes'] as $attribute) {
-            $envasado_attributes[] = [
-                'id_attribute' => $attribute['id_attribute'],
-                'id_attribute_group' => $group['id_attribute_group'],
-                'name' => $group['name'] . ' - ' . $attribute['name']
-            ];
-        }
-    }
-    
-    // Obtener combinaciones del producto
-    $combinations = $this->getProductCombinations($id_product, $product_config);
-    
-    // Asignar variables a la plantilla
-    $this->context->smarty->assign([
-        'id_product' => $id_product,
-        'product' => $product,
-        'product_config' => $product_config,
-        'precio_base_producto' => $precio_base_producto,
-        'precio_individual' => $precio_individual,
-        'attribute_groups' => $attribute_groups,
-        'envasado_attributes' => $envasado_attributes,
-        'combinations' => $combinations,
-        'current_url' => $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name . '&action=product&id_product=' . $id_product,
-        'link' => $this->context->link, // Añadimos el objeto link a la plantilla
-    ]);
-    
-    // Renderizar la plantilla
-    return $this->context->smarty->fetch($this->local_path . 'views/templates/admin/product_config.tpl');
-}
+        $attributes_options = array(
+            array('id_option' => 0, 'name' => $this->l('-- Seleccionar --')),
+        );
 
-    /**
-     * Obtiene la información detallada de las combinaciones de un producto
-     */
-    private function getProductCombinations($id_product, $product_config)
-    {
-        $combinations = [];
-        
-        // Obtener todas las combinaciones básicas
-        $sql = "SELECT id_product_attribute, price
-                FROM " . _DB_PREFIX_ . "product_attribute 
-                WHERE id_product = " . (int)$id_product;
-        
-        $product_combinations = Db::getInstance()->executeS($sql);
-        
-        if (empty($product_combinations)) {
-            return $combinations;
-        }
-        
-        // Obtener la tasa de IVA
-        $tax_rate = CombinacionesCarneModel::getTaxRate($id_product);
-        $tax_multiplier = 1 + ($tax_rate / 100);
-        
-        // Obtener los mapeos de peso
-        $peso_mapeos = CombinacionesCarneModel::getAllPesoMapeos();
-        
-        // Para cada combinación, obtener sus atributos
-        foreach ($product_combinations as $pc) {
-            $id_product_attribute = (int)$pc['id_product_attribute'];
-            
-            // Obtener atributos de esta combinación
-            $sql = "SELECT a.id_attribute, a.id_attribute_group, al.name as attribute_name, 
-                           agl.name as group_name
-                    FROM " . _DB_PREFIX_ . "product_attribute_combination pac
-                    INNER JOIN " . _DB_PREFIX_ . "attribute a 
-                        ON pac.id_attribute = a.id_attribute
-                    INNER JOIN " . _DB_PREFIX_ . "attribute_lang al 
-                        ON a.id_attribute = al.id_attribute 
-                        AND al.id_lang = " . (int)$this->context->language->id . "
-                    INNER JOIN " . _DB_PREFIX_ . "attribute_group ag 
-                        ON a.id_attribute_group = ag.id_attribute_group
-                    INNER JOIN " . _DB_PREFIX_ . "attribute_group_lang agl 
-                        ON ag.id_attribute_group = agl.id_attribute_group 
-                        AND agl.id_lang = " . (int)$this->context->language->id . "
-                    WHERE pac.id_product_attribute = " . $id_product_attribute;
-            
-            $attributes = Db::getInstance()->executeS($sql);
-            
-            if (empty($attributes)) {
-                continue;
-            }
-            
-            // Inicializar combinación
-            $combination = [
-                'id_product_attribute' => $id_product_attribute,
-                'impact_price' => (float)$pc['price'],
-                'impact_price_with_tax' => (float)$pc['price'] * $tax_multiplier,
-                'attributes' => $attributes,
-                'es_individual' => false,
-                'peso_gramos' => 0,
-                'peso_kg' => 0,
-                'needs_update' => false
-            ];
-            
-            // Procesar atributos para determinar si es envasado individual y el peso
-            foreach ($attributes as $attribute) {
-                $id_attribute = (int)$attribute['id_attribute'];
-                $id_attribute_group = (int)$attribute['id_attribute_group'];
-                
-                // Detectar si es envasado individual
-                if ($id_attribute_group == $product_config['id_attribute_group_envasado']) {
-                    if ($id_attribute == $product_config['id_attribute_envasado_individual']) {
-                        $combination['es_individual'] = true;
-                    }
-                }
-                
-                // Detectar peso
-                if ($id_attribute_group == $product_config['id_attribute_group_peso']) {
-                    if (isset($peso_mapeos[$id_attribute])) {
-                        $combination['peso_gramos'] = (int)$peso_mapeos[$id_attribute];
-                        $combination['peso_kg'] = $combination['peso_gramos'] / 1000;
-                    }
-                }
-            }
-            
-            // Determinar si la combinación necesita actualización
-            $expectedImpactPrice = $this->calculateExpectedImpactPrice(
-                $product_config, 
-                $combination['peso_kg'], 
-                $combination['es_individual'],
-                $precio_base_producto,
-                $precio_individual,
-                $tax_multiplier
-            );
-            
-            // Comprobar si el precio actual difiere del esperado (con un margen de tolerancia para errores de redondeo)
-            if (abs($combination['impact_price'] - $expectedImpactPrice) > 0.001) {
-                $combination['needs_update'] = true;
-            }
-            
-            $combinations[] = $combination;
-        }
-        
-        return $combinations;
-    }
-
-		
-		/**
-     * Calcula el impacto de precio esperado para una combinación
-     */
-    private function calculateExpectedImpactPrice($config, $peso_kg, $es_individual, $precio_base, $precio_individual, $tax_multiplier)
-    {
-        // Calculamos el impacto de precio basado en la diferencia con 1kg (PRECIO CON IVA)
-        $impacto_precio_con_iva = $precio_base * ($peso_kg - 1);
-        
-        // Si es envasado individual, sumamos el coste adicional (CON IVA)
-        if ($es_individual) {
-            $impacto_precio_con_iva += $precio_individual;
-        }
-        
-        // Convertimos el impacto a valor SIN IVA para que PrestaShop lo interprete correctamente
-        $impacto_precio = $impacto_precio_con_iva / $tax_multiplier;
-        
-        // Redondeamos a 6 decimales (formato de PrestaShop)
-        return round($impacto_precio, 6);
-    }
-
-    /**
-     * Obtiene la lista de productos con combinaciones
-     */
-    protected function getProductsWithCombinations()
-    {
-        $sql = "SELECT p.id_product, pl.name, p.reference 
-                FROM `" . _DB_PREFIX_ . "product` p
-                INNER JOIN `" . _DB_PREFIX_ . "product_lang` pl ON (p.id_product = pl.id_product AND pl.id_lang = " . (int)$this->context->language->id . " AND pl.id_shop = " . (int)$this->context->shop->id . ")
-                WHERE p.id_product IN (
-                    SELECT DISTINCT id_product FROM `" . _DB_PREFIX_ . "product_attribute`
-                )
-                ORDER BY pl.name ASC";
-                
-        return Db::getInstance()->executeS($sql);
-    }
-
-    /**
-     * Obtener grupos de atributos y sus valores de forma correcta
-     */
-    private function getAttributeGroupsWithValues()
-    {
-        $id_lang = (int)$this->context->language->id;
-        
-        // Obtener todos los grupos de atributos
-        $sql = "SELECT ag.id_attribute_group, agl.name 
-                FROM `" . _DB_PREFIX_ . "attribute_group` ag
-                LEFT JOIN `" . _DB_PREFIX_ . "attribute_group_lang` agl 
-                    ON (ag.id_attribute_group = agl.id_attribute_group AND agl.id_lang = " . $id_lang . ")
-                ORDER BY ag.position ASC";
-        
-        $groups = Db::getInstance()->executeS($sql);
-        $result = array();
-        
-        // Para cada grupo, obtener sus atributos
-        foreach ($groups as $group) {
-            $group_data = array(
-                'id_attribute_group' => $group['id_attribute_group'],
+        foreach ($attribute_groups as $group) {
+            $groups_options[] = array(
+                'id_option' => $group['id_attribute_group'],
                 'name' => $group['name'],
-                'attributes' => array()
             );
-            
-            // Obtener los atributos de este grupo
-            $sql = "SELECT a.id_attribute, al.name
-                    FROM `" . _DB_PREFIX_ . "attribute` a
-                    LEFT JOIN `" . _DB_PREFIX_ . "attribute_lang` al 
-                        ON (a.id_attribute = al.id_attribute AND al.id_lang = " . $id_lang . ")
-                    WHERE a.id_attribute_group = " . (int)$group['id_attribute_group'] . "
-                    ORDER BY a.position ASC";
-                    
-            $attributes = Db::getInstance()->executeS($sql);
-            
-            if (!empty($attributes)) {
-                $group_data['attributes'] = $attributes;
-                $result[] = $group_data;
+
+            foreach ($group['attributes'] as $attribute) {
+                $attributes_options[] = array(
+                    'id_option' => $attribute['id_attribute'],
+                    'name' => $group['name'] . ' - ' . $attribute['name'],
+                    'group' => $group['id_attribute_group'],
+                );
             }
         }
-        
-        return $result;
+
+        return array(
+            'form' => array(
+                'legend' => array(
+                    'title' => $this->l('Configuración de Precios'),
+                    'icon' => 'icon-cogs',
+                ),
+                'input' => array(
+                    array(
+                        'type' => 'text',
+                        'label' => $this->l('Precio de envasado individual (€)'),
+                        'name' => 'COMBINACIONESCARNE_PRECIO_INDIVIDUAL',
+                        'desc' => $this->l('Coste adicional por envasado individual (por defecto 1.50€)'),
+                        'class' => 'fixed-width-sm',
+                        'suffix' => '€',
+                    ),
+                    array(
+                        'type' => 'select',
+                        'label' => $this->l('Grupo de atributos para Peso'),
+                        'name' => 'COMBINACIONESCARNE_GRUPO_PESO',
+                        'desc' => $this->l('Obligatorio. Grupo de atributos que define el peso del producto (p.ej. "Peso" con valores 500g, 1kg...).'),
+                        'options' => array(
+                            'query' => $groups_options,
+                            'id' => 'id_option',
+                            'name' => 'name',
+                        ),
+                    ),
+                    array(
+                        'type' => 'select',
+                        'label' => $this->l('Grupo de atributos para Envasado'),
+                        'name' => 'COMBINACIONESCARNE_GRUPO_ENVASADO',
+                        'desc' => $this->l('Opcional. Si el producto no usa distinción de envasado, déjalo en "-- Seleccionar --" y el módulo calculará solo por peso.'),
+                        'options' => array(
+                            'query' => $groups_options,
+                            'id' => 'id_option',
+                            'name' => 'name',
+                        ),
+                    ),
+                    array(
+                        'type' => 'select',
+                        'label' => $this->l('Atributo para Envasado Granel'),
+                        'name' => 'COMBINACIONESCARNE_ATRIBUTO_GRANEL',
+                        'desc' => $this->l('Seleccione el atributo que representa el envasado a granel (informativo; cualquier atributo del grupo de envasado que no sea "Individual" se trata como granel).'),
+                        'options' => array(
+                            'query' => $attributes_options,
+                            'id' => 'id_option',
+                            'name' => 'name',
+                        ),
+                    ),
+                    array(
+                        'type' => 'select',
+                        'label' => $this->l('Atributo para Envasado Individual'),
+                        'name' => 'COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL',
+                        'desc' => $this->l('Seleccione el atributo que representa el envasado individual (lleva el coste adicional).'),
+                        'options' => array(
+                            'query' => $attributes_options,
+                            'id' => 'id_option',
+                            'name' => 'name',
+                        ),
+                    ),
+                ),
+                'submit' => array(
+                    'title' => $this->l('Guardar'),
+                ),
+            ),
+        );
     }
 
     /**
@@ -718,166 +413,502 @@ $precio_base_producto = $product->price * $tax_multiplier;
     }
 
     /**
-     * Hook que se ejecuta al actualizar un producto
+     * Renderiza el formulario de gestión de mapeos de peso
+     */
+    protected function renderMapeoPesoConfig()
+    {
+        $html = '';
+
+        $attribute_groups = $this->getAttributeGroupsWithValues();
+        $mapeos_detallados = CombinacionesCarneModel::getPesoMapeosDetallados();
+
+        $html .= '<div class="panel">';
+        $html .= '<div class="panel-heading"><i class="icon-plus"></i> ' . $this->l('Añadir nuevo mapeo de peso') . '</div>';
+
+        $html .= '<form id="add_mapeo_form" class="form-horizontal" action="' .
+                $this->context->link->getAdminLink('AdminModules') .
+                '&configure=' . $this->name . '&action=mapeos" method="post">';
+
+        $html .= '<div class="form-group">';
+        $html .= '<label class="control-label col-lg-3">' . $this->l('Atributo') . '</label>';
+        $html .= '<div class="col-lg-6">';
+        $html .= '<select name="id_attribute" class="form-control">';
+        $html .= '<option value="0">-- ' . $this->l('Seleccionar') . ' --</option>';
+
+        foreach ($attribute_groups as $group) {
+            $html .= '<optgroup label="' . $group['name'] . '">';
+            foreach ($group['attributes'] as $attribute) {
+                $html .= '<option value="' . $attribute['id_attribute'] . '">' . $attribute['name'] . '</option>';
+            }
+            $html .= '</optgroup>';
+        }
+
+        $html .= '</select>';
+        $html .= '</div>';
+        $html .= '</div>';
+
+        $html .= '<div class="form-group">';
+        $html .= '<label class="control-label col-lg-3">' . $this->l('Peso (g)') . '</label>';
+        $html .= '<div class="col-lg-6">';
+        $html .= '<div class="input-group">';
+        $html .= '<input type="number" name="peso_gramos" value="0" min="1" class="form-control">';
+        $html .= '<span class="input-group-addon">g</span>';
+        $html .= '</div>';
+        $html .= '<p class="help-block">' . $this->l('Introduce el peso en gramos (p.ej: 500 para medio kilo)') . '</p>';
+        $html .= '</div>';
+        $html .= '</div>';
+
+        $html .= '<div class="panel-footer">';
+        $html .= '<button type="submit" name="submitMapeoPeso" class="btn btn-default pull-right">';
+        $html .= '<i class="icon-save"></i> ' . $this->l('Guardar') . '</button>';
+        $html .= '</div>';
+
+        $html .= '</form>';
+        $html .= '</div>';
+
+        $html .= '<div class="panel">';
+        $html .= '<div class="panel-heading"><i class="icon-list"></i> ' . $this->l('Mapeos de peso existentes') . '</div>';
+
+        if (empty($mapeos_detallados)) {
+            $html .= '<div class="alert alert-warning">' . $this->l('No hay mapeos de peso configurados.') . '</div>';
+        } else {
+            $html .= '<div class="table-responsive">';
+            $html .= '<table class="table">';
+            $html .= '<thead><tr>';
+            $html .= '<th>' . $this->l('Grupo') . '</th>';
+            $html .= '<th>' . $this->l('Atributo') . '</th>';
+            $html .= '<th>' . $this->l('Peso (g)') . '</th>';
+            $html .= '<th>' . $this->l('Peso (kg)') . '</th>';
+            $html .= '<th>' . $this->l('Acciones') . '</th>';
+            $html .= '</tr></thead>';
+            $html .= '<tbody>';
+
+            $form_action = $this->context->link->getAdminLink('AdminModules') . '&configure=' . $this->name . '&action=mapeos';
+
+            foreach ($mapeos_detallados as $group) {
+                foreach ($group['attributes'] as $attribute) {
+                    $html .= '<tr>';
+                    $html .= '<td>' . $group['name'] . '</td>';
+                    $html .= '<td>' . $attribute['name'] . '</td>';
+                    $html .= '<td>';
+                    // Edición en línea: reenvía al mismo submitMapeoPeso, que ya actualiza si el atributo existe.
+                    $html .= '<form class="form-inline" action="' . $form_action . '" method="post" style="margin:0;">';
+                    $html .= '<input type="hidden" name="id_attribute" value="' . $attribute['id_attribute'] . '">';
+                    $html .= '<div class="input-group input-group-sm" style="width:140px;">';
+                    $html .= '<input type="number" name="peso_gramos" value="' . $attribute['peso_gramos'] . '" min="1" class="form-control">';
+                    $html .= '<span class="input-group-addon">g</span>';
+                    $html .= '</div> ';
+                    $html .= '<button type="submit" name="submitMapeoPeso" class="btn btn-default btn-sm" title="' . $this->l('Guardar') . '">';
+                    $html .= '<i class="icon-save"></i></button>';
+                    $html .= '</form>';
+                    $html .= '</td>';
+                    $html .= '<td>' . number_format($attribute['peso_gramos'] / 1000, 3) . ' kg</td>';
+                    $html .= '<td>';
+                    $html .= '<a href="' . $this->context->link->getAdminLink('AdminModules') .
+                             '&configure=' . $this->name . '&action=mapeos&deleteMapeoPeso=1&id_attribute=' .
+                             $attribute['id_attribute'] . '" class="btn btn-default"
+                             onclick="return confirm(\'' . $this->l('¿Estás seguro que deseas eliminar este mapeo?') . '\');">';
+                    $html .= '<i class="icon-trash"></i> ' . $this->l('Eliminar');
+                    $html .= '</a>';
+                    $html .= '</td>';
+                    $html .= '</tr>';
+                }
+            }
+
+            $html .= '</tbody></table></div>';
+        }
+
+        $html .= '</div>';
+
+        return $html;
+    }
+
+    /**
+     * Renderiza la lista de productos como links directos
+     */
+    protected function renderProductSelector()
+    {
+        $html = '';
+        $products = $this->getProductsWithCombinations();
+
+        $html .= '<div class="panel"><div class="panel-heading"><i class="icon-tags"></i> ' .
+                 $this->l('Productos con combinaciones') . '</div>';
+
+        $html .= '<div class="alert alert-info">' .
+            $this->l('El cálculo se hace solo. Normalmente no necesitas entrar aquí: entra en la ficha del producto, cambia el precio y guarda. Esta lista es solo para consultar el estado de cada producto o recalcular a mano.') .
+            '</div>';
+
+        $html .= '<div class="list-group">';
+
+        foreach ($products as $product) {
+            $config = CombinacionesCarneModel::getProductConfig($product['id_product']);
+            $activeClass = (Tools::getValue('id_product') == $product['id_product']) ? 'active' : '';
+            $estado = !empty($config['active'])
+                ? '<span class="label label-success">' . $this->l('Activo') . '</span>'
+                : '<span class="label label-default">' . $this->l('Inactivo') . '</span>';
+
+            $url_ficha_producto = $this->context->link->getAdminLink('AdminProducts') .
+                '&id_product=' . $product['id_product'] . '&updateproduct&token=' . Tools::getAdminTokenLite('AdminProducts');
+
+            $html .= '<div class="list-group-item ' . $activeClass . '" style="display:flex; align-items:center; justify-content:space-between;">';
+            $html .= '<a href="' . $this->context->link->getAdminLink('AdminModules') .
+                     '&configure=' . $this->name . '&action=product&id_product=' . $product['id_product'] .
+                     '&token=' . Tools::getAdminTokenLite('AdminModules') . '" style="flex:1;">' .
+                     $product['name'] . ' (ID: ' . $product['id_product'] . ', Ref: ' . $product['reference'] . ') ' . $estado . '</a>';
+            $html .= '<a href="' . $url_ficha_producto . '" class="btn btn-default btn-xs" target="_blank" title="' . $this->l('Abrir ficha del producto') . '">';
+            $html .= '<i class="icon-external-link"></i></a>';
+            $html .= '</div>';
+        }
+
+        $html .= '</div>';
+        $html .= '</div>';
+
+        return $html;
+    }
+
+    /**
+     * Obtener grupos de atributos y sus valores
+     */
+    private function getAttributeGroupsWithValues()
+    {
+        $id_lang = (int) $this->context->language->id;
+
+        $sql = "SELECT ag.id_attribute_group, agl.name
+                FROM `" . _DB_PREFIX_ . "attribute_group` ag
+                LEFT JOIN `" . _DB_PREFIX_ . "attribute_group_lang` agl
+                    ON (ag.id_attribute_group = agl.id_attribute_group AND agl.id_lang = " . $id_lang . ")
+                ORDER BY ag.position ASC";
+
+        $groups = Db::getInstance()->executeS($sql);
+        $result = array();
+
+        foreach ($groups as $group) {
+            $group_data = array(
+                'id_attribute_group' => $group['id_attribute_group'],
+                'name' => $group['name'],
+                'attributes' => array(),
+            );
+
+            $sql = "SELECT a.id_attribute, al.name
+                    FROM `" . _DB_PREFIX_ . "attribute` a
+                    LEFT JOIN `" . _DB_PREFIX_ . "attribute_lang` al
+                        ON (a.id_attribute = al.id_attribute AND al.id_lang = " . $id_lang . ")
+                    WHERE a.id_attribute_group = " . (int) $group['id_attribute_group'] . "
+                    ORDER BY a.position ASC";
+
+            $attributes = Db::getInstance()->executeS($sql);
+
+            if (!empty($attributes)) {
+                $group_data['attributes'] = $attributes;
+                $result[] = $group_data;
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Renderiza la configuración de un producto específico
+     */
+    protected function renderProductConfiguration($id_product)
+    {
+        $html = '';
+
+        $product = new Product($id_product, false, $this->context->language->id);
+
+        if (!Validate::isLoadedObject($product)) {
+            return $html;
+        }
+
+        $config = CombinacionesCarneModel::getProductConfig($id_product);
+        $tiene_override = !empty($config['id_attribute_group_envasado']) || !empty($config['id_attribute_group_peso']);
+
+        $grupo_peso = !empty($config['id_attribute_group_peso'])
+            ? (int) $config['id_attribute_group_peso']
+            : (int) Configuration::get('COMBINACIONESCARNE_GRUPO_PESO', 0);
+        $grupo_envasado = !empty($config['id_attribute_group_envasado'])
+            ? (int) $config['id_attribute_group_envasado']
+            : (int) Configuration::get('COMBINACIONESCARNE_GRUPO_ENVASADO', 0);
+        $atributo_individual = !empty($config['id_attribute_group_envasado'])
+            ? (int) $config['id_attribute_envasado_individual']
+            : (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL', 0);
+
+        $config_resuelta = array(
+            'id_attribute_group_peso' => $grupo_peso,
+            'id_attribute_group_envasado' => $grupo_envasado,
+            'id_attribute_envasado_individual' => $atributo_individual,
+        );
+
+        $precio_base_producto = CombinacionesCarneModel::getPrecioBaseConIva($id_product, $product);
+        $precio_individual = (float) Configuration::get('COMBINACIONESCARNE_PRECIO_INDIVIDUAL');
+        $tax_rate = CombinacionesCarneModel::getTaxRate($id_product);
+        $tax_multiplier = 1 + ($tax_rate / 100);
+        $peso_mapeos = CombinacionesCarneModel::getAllPesoMapeos();
+
+        $sql = "SELECT id_product_attribute, price, reference
+                FROM " . _DB_PREFIX_ . "product_attribute
+                WHERE id_product = " . (int) $id_product;
+
+        $product_combinations = Db::getInstance()->executeS($sql);
+        $combinations = array();
+
+        if (!empty($product_combinations)) {
+            foreach ($product_combinations as $pc) {
+                $id_product_attribute = (int) $pc['id_product_attribute'];
+
+                $sql = "SELECT a.id_attribute, a.id_attribute_group, al.name as attribute_name,
+                               agl.name as group_name
+                        FROM " . _DB_PREFIX_ . "product_attribute_combination pac
+                        INNER JOIN " . _DB_PREFIX_ . "attribute a
+                            ON pac.id_attribute = a.id_attribute
+                        INNER JOIN " . _DB_PREFIX_ . "attribute_lang al
+                            ON a.id_attribute = al.id_attribute
+                            AND al.id_lang = " . (int) $this->context->language->id . "
+                        INNER JOIN " . _DB_PREFIX_ . "attribute_group ag
+                            ON a.id_attribute_group = ag.id_attribute_group
+                        INNER JOIN " . _DB_PREFIX_ . "attribute_group_lang agl
+                            ON ag.id_attribute_group = agl.id_attribute_group
+                            AND agl.id_lang = " . (int) $this->context->language->id . "
+                        WHERE pac.id_product_attribute = " . $id_product_attribute;
+
+                $attributes = Db::getInstance()->executeS($sql);
+                $analisis = CombinacionesCarneModel::analizarAtributosCombinacion($attributes, $config_resuelta, $peso_mapeos);
+
+                $attrs_nombres = array();
+                foreach ($attributes as $attribute) {
+                    $attrs_nombres[] = $attribute['group_name'] . ': ' . $attribute['attribute_name'];
+                }
+
+                $combinations[$id_product_attribute] = array(
+                    'id_product_attribute' => $id_product_attribute,
+                    'reference' => $pc['reference'],
+                    'attributes_text' => implode(', ', $attrs_nombres),
+                    'analisis' => $analisis,
+                );
+            }
+        }
+
+        $url_ficha_producto = $this->context->link->getAdminLink('AdminProducts') .
+            '&id_product=' . $id_product . '&updateproduct&token=' . Tools::getAdminTokenLite('AdminProducts');
+
+        $html .= '<div class="panel">';
+        $html .= '<div class="panel-heading">';
+        $html .= '<i class="icon-cog"></i> ' . $this->l('Configuración para:') . ' ' . $product->name;
+        $html .= ' <a href="' . $url_ficha_producto . '" class="btn btn-default btn-xs pull-right" target="_blank">';
+        $html .= '<i class="icon-external-link"></i> ' . $this->l('Abrir ficha del producto');
+        $html .= '</a>';
+        $html .= '</div>';
+
+        if ($tiene_override) {
+            $html .= '<div class="alert alert-info">' .
+                $this->l('Este producto tiene su propia configuración de grupos de atributos, distinta de la general.') .
+                '</div>';
+        } else {
+            $html .= '<div class="alert alert-info">' .
+                $this->l('Este producto usa la configuración general del módulo (Configuración General).') .
+                '</div>';
+        }
+
+        if (empty($grupo_peso)) {
+            $html .= '<div class="alert alert-warning">' .
+                $this->l('No hay ningún grupo de atributos de peso configurado (ni para este producto, ni en la configuración general). El módulo no puede calcular nada hasta que se configure.') .
+                '</div>';
+        }
+
+        $html .= '<form id="product_config_form" class="form-horizontal" action="' .
+                $this->context->link->getAdminLink('AdminModules') .
+                '&configure=' . $this->name . '&action=product" method="post">';
+
+        $html .= '<input type="hidden" name="id_product" value="' . $id_product . '">';
+
+        $html .= '<div class="form-group">';
+        $html .= '<label class="control-label col-lg-3">' . $this->l('Precio base del producto (con IVA)') . '</label>';
+        $html .= '<div class="col-lg-9">';
+        $html .= '<div class="input-group">';
+        $html .= '<input type="text" value="' . $precio_base_producto . '" class="form-control" disabled="disabled">';
+        $html .= '<span class="input-group-addon">€</span>';
+        $html .= '</div>';
+        $html .= '<p class="help-block">' . $this->l('Este precio se trata como el precio por 1 kilo a granel; cada combinación se calcula a partir de él.') . '</p>';
+        $html .= '</div>';
+        $html .= '</div>';
+
+        $html .= '<div class="panel-footer">';
+        $html .= '<button type="submit" name="submitCalculate" class="btn btn-primary pull-right"
+                     onclick="return confirm(\'' . $this->l('¿Recalcular ahora el precio de todas las combinaciones de este producto?') . '\');">';
+        $html .= '<i class="icon-cogs"></i> ' . $this->l('Calcular y aplicar precios') . '</button>';
+        $html .= '</div>';
+
+        $html .= '</form>';
+
+        if (!empty($combinations)) {
+            $html .= '<div class="table-responsive">';
+            $html .= '<table class="table">';
+            $html .= '<thead><tr>';
+            $html .= '<th>' . $this->l('ID') . '</th>';
+            $html .= '<th>' . $this->l('Referencia') . '</th>';
+            $html .= '<th>' . $this->l('Atributos') . '</th>';
+            $html .= '<th>' . $this->l('Tipo') . '</th>';
+            $html .= '<th>' . $this->l('Estado') . '</th>';
+            $html .= '<th>' . $this->l('Impacto en el precio (con IVA)') . '</th>';
+            $html .= '<th>' . $this->l('Nuevo precio calculado') . '</th>';
+            $html .= '</tr></thead>';
+            $html .= '<tbody>';
+
+            foreach ($combinations as $combination) {
+                $analisis = $combination['analisis'];
+
+                $html .= '<tr' . (!$analisis['tiene_peso'] ? ' class="warning"' : '') . '>';
+                $html .= '<td>' . $combination['id_product_attribute'] . '</td>';
+                $html .= '<td>' . (!empty($combination['reference']) ? $combination['reference'] : '-') . '</td>';
+                $html .= '<td>' . $combination['attributes_text'] . '</td>';
+
+                if (!$analisis['tiene_envasado']) {
+                    $tipo = $this->l('Solo peso');
+                } elseif ($analisis['es_individual']) {
+                    $tipo = $this->l('Peso + envasado individual');
+                } else {
+                    $tipo = $this->l('Peso + envasado a granel');
+                }
+                $html .= '<td>' . $tipo . '</td>';
+
+                if ($analisis['tiene_peso']) {
+                    $html .= '<td><span class="label label-success">' . $this->l('Calculado') . '</span></td>';
+
+                    $impacto_con_iva = $precio_base_producto * (($analisis['peso_gramos'] / 1000) - 1);
+                    if ($analisis['es_individual']) {
+                        $impacto_con_iva += $precio_individual;
+                    }
+                    $nuevo_precio = $precio_base_producto + $impacto_con_iva;
+
+                    $html .= '<td>' . Tools::displayPrice($impacto_con_iva) . '</td>';
+                    $html .= '<td>' . Tools::displayPrice($nuevo_precio) . '</td>';
+                } else {
+                    $html .= '<td><span class="label label-warning">' . $this->l('Sin peso mapeado - no se toca') . '</span></td>';
+                    $html .= '<td>-</td>';
+                    $html .= '<td>-</td>';
+                }
+
+                $html .= '</tr>';
+            }
+
+            $html .= '</tbody></table></div>';
+        }
+
+        $html .= '</div>';
+
+        return $html;
+    }
+
+    /**
+     * Obtener la lista de productos con combinaciones
+     */
+    protected function getProductsWithCombinations()
+    {
+        $sql = "SELECT p.id_product, pl.name, p.reference
+                FROM `" . _DB_PREFIX_ . "product` p
+                INNER JOIN `" . _DB_PREFIX_ . "product_lang` pl ON (p.id_product = pl.id_product AND pl.id_lang = " . (int) $this->context->language->id . " AND pl.id_shop = " . (int) $this->context->shop->id . ")
+                WHERE p.id_product IN (
+                    SELECT DISTINCT id_product FROM `" . _DB_PREFIX_ . "product_attribute`
+                )
+                ORDER BY pl.name ASC";
+
+        return Db::getInstance()->executeS($sql);
+    }
+
+    /**
+     * Hook al actualizar un producto (p.ej. al cambiar el precio y guardar)
      */
     public function hookActionProductUpdate($params)
     {
         if (isset($params['id_product'])) {
             $id_product = (int) $params['id_product'];
-            
-            // Verificamos si la configuración para este producto está activada
-            $config = CombinacionesCarneModel::getProductConfig($id_product);
-            if (!empty($config) && $config['active']) {
-                // Actualizamos las combinaciones
-                CombinacionesCarneModel::updateCombinationPrices($id_product);
-            }
-        }
-    }
-    
-    /**
-     * Hook que se ejecuta al actualizar una combinación
-     */
-    public function hookActionProductAttributeUpdate($params)
-    {
-        if (isset($params['id_product'])) {
-            $id_product = (int) $params['id_product'];
-            $config = CombinacionesCarneModel::getProductConfig($id_product);
-            if (!empty($config) && $config['active']) {
+            $config = CombinacionesCarneModel::ensureActiveIfQualifies($id_product);
+
+            if (!empty($config['active'])) {
                 CombinacionesCarneModel::updateCombinationPrices($id_product);
             }
         }
     }
 
     /**
-     * Hook que se ejecuta al añadir una combinación
+     * Hook al actualizar una combinación
+     */
+    public function hookActionProductAttributeUpdate($params)
+    {
+        if (isset($params['id_product'])) {
+            $id_product = (int) $params['id_product'];
+            $config = CombinacionesCarneModel::ensureActiveIfQualifies($id_product);
+
+            if (!empty($config['active'])) {
+                CombinacionesCarneModel::updateCombinationPrices($id_product);
+            }
+        }
+    }
+
+    /**
+     * Hook al añadir una combinación nueva
      */
     public function hookActionProductAttributeAdd($params)
     {
         if (isset($params['id_product_attribute']) && isset($params['id_product'])) {
             $id_product = (int) $params['id_product'];
             $id_product_attribute = (int) $params['id_product_attribute'];
-            
-            // Verificamos si el producto ya está configurado
-            $config = CombinacionesCarneModel::getProductConfig($id_product);
-            
-            // Si no está configurado, intentamos aplicar configuración global
-            if (!$config['active']) {
-                $this->hookActionProductSave($params);
-                $config = CombinacionesCarneModel::getProductConfig($id_product); // Recargamos config
-            }
-            
-            // Si está activo, actualizamos los precios de la combinación
-            if ($config['active']) {
-                // Actualizar solo esta combinación específica
+
+            $config = CombinacionesCarneModel::ensureActiveIfQualifies($id_product);
+
+            if (!empty($config['active'])) {
                 CombinacionesCarneModel::updateCombinationPrice($id_product, $id_product_attribute);
-                
-                // Registro en log
-                file_put_contents(
-                    _PS_MODULE_DIR_ . 'combinacionescarne/auto_log.txt',
-                    date('Y-m-d H:i:s') . " - Combinación ID: " . $id_product_attribute . " del producto ID: " . $id_product . " actualizada automáticamente\n",
-                    FILE_APPEND
-                );
             }
         }
     }
 
     /**
-     * Hook que se ejecuta al eliminar una combinación
+     * Hook al eliminar una combinación
      */
     public function hookActionProductAttributeDelete($params)
     {
         if (isset($params['id_product'])) {
             $id_product = (int) $params['id_product'];
             $config = CombinacionesCarneModel::getProductConfig($id_product);
-            if (!empty($config) && $config['active']) {
+
+            if (!empty($config['active'])) {
                 CombinacionesCarneModel::updateCombinationPrices($id_product);
-            }
-        }
-    }
-    
-    /**
-     * Hook para detectar la adición o actualización de producto
-     * Aplicará la configuración global a productos nuevos con combinaciones
-     */
-    public function hookActionProductSave($params)
-    {
-        // Esto se activará cuando se cree un producto nuevo o se edite uno existente
-        if (isset($params['id_product'])) {
-            $id_product = (int) $params['id_product'];
-            
-            // Verificamos si ya existe configuración para este producto
-            $config = CombinacionesCarneModel::getProductConfig($id_product);
-            
-            // Si no está activo (es nuevo o nunca se ha configurado)
-            if (!$config['active']) {
-                // Verificamos si el producto tiene combinaciones
-                $has_combinations = $this->productHasCombinations($id_product);
-                
-                if ($has_combinations) {
-                    // Aplicamos la configuración global automáticamente
-                    $global_config = array(
-                        'precio_por_kilo' => 0, // Ya no usamos este campo
-                        'id_attribute_group_envasado' => (int) Configuration::get('COMBINACIONESCARNE_GRUPO_ENVASADO', 0),
-                        'id_attribute_envasado_granel' => (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_GRANEL', 0),
-                        'id_attribute_envasado_individual' => (int) Configuration::get('COMBINACIONESCARNE_ATRIBUTO_INDIVIDUAL', 0),
-                        'id_attribute_group_peso' => (int) Configuration::get('COMBINACIONESCARNE_GRUPO_PESO', 0),
-                        'active' => 1 // Activamos automáticamente
-                    );
-                    
-                    // Guardamos la configuración
-                    CombinacionesCarneModel::saveProductConfig($id_product, $global_config);
-                    
-                    // Calculamos los precios iniciales
-                    CombinacionesCarneModel::updateCombinationPrices($id_product);
-                    
-                    // Registro en log
-                    file_put_contents(
-                        _PS_MODULE_DIR_ . 'combinacionescarne/auto_log.txt',
-                        date('Y-m-d H:i:s') . " - Producto ID: " . $id_product . " configurado automáticamente\n",
-                        FILE_APPEND
-                    );
-                }
             }
         }
     }
 
     /**
-     * Comprueba si un producto tiene combinaciones
-     * 
-     * @param int $id_product ID del producto
-     * @return bool True si tiene combinaciones, False en caso contrario
+     * Hook al guardar un producto (crear o editar). Es donde se detecta si un
+     * producto nuevo (o uno que nunca se había activado) cumple las
+     * condiciones para que el módulo empiece a calcular sus combinaciones
+     * solo, sin que haga falta entrar al módulo.
      */
-    private function productHasCombinations($id_product)
+    public function hookActionProductSave($params)
     {
-        $count = Db::getInstance()->getValue(
-            "SELECT COUNT(*) FROM `" . _DB_PREFIX_ . "product_attribute` 
-             WHERE `id_product` = " . (int)$id_product
-        );
-        
-        return $count > 0;
+        if (isset($params['id_product'])) {
+            $id_product = (int) $params['id_product'];
+            $config = CombinacionesCarneModel::ensureActiveIfQualifies($id_product);
+
+            if (!empty($config['active'])) {
+                CombinacionesCarneModel::updateCombinationPrices($id_product);
+            }
+        }
     }
-    
+
     /**
-     * Hook para productos eliminados
-     * Limpia la configuración cuando se elimina un producto
+     * Hook para productos eliminados: limpia la configuración guardada
      */
     public function hookActionProductDelete($params)
     {
         if (isset($params['id_product'])) {
             $id_product = (int) $params['id_product'];
-            
-            // Eliminar la configuración del producto
+
             Db::getInstance()->execute(
                 "DELETE FROM `" . _DB_PREFIX_ . "combinacionescarne_product`
                  WHERE `id_product` = " . $id_product
             );
-            
-            // Registro en log
-            file_put_contents(
-                _PS_MODULE_DIR_ . 'combinacionescarne/auto_log.txt',
-                date('Y-m-d H:i:s') . " - Configuración eliminada para producto ID: " . $id_product . " (producto eliminado)\n",
-                FILE_APPEND
-            );
+
+            CombinacionesCarneModel::writeLog('Configuración eliminada para producto ID: ' . $id_product . ' (producto eliminado)');
         }
     }
 }
