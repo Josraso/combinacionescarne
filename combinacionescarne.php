@@ -6,7 +6,7 @@
  * basado en el peso y, opcionalmente, en el tipo de envasado (granel/individual).
  *
  * @author   josra
- * @version  1.1.3
+ * @version  1.1.4
  */
 
 if (!defined('_PS_VERSION_')) {
@@ -22,7 +22,7 @@ class CombinacionesCarne extends Module
     {
         $this->name = 'combinacionescarne';
         $this->tab = 'pricing_promotion';
-        $this->version = '1.1.3';
+        $this->version = '1.1.4';
         $this->author = 'josra';
         $this->need_instance = 0;
         $this->bootstrap = true;

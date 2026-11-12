@@ -2,7 +2,7 @@
 <module>
     <name>combinacionescarne</name>
     <displayName><![CDATA[Combinaciones Automáticas para Carne]]></displayName>
-    <version><![CDATA[1.1.3]]></version>
+    <version><![CDATA[1.1.4]]></version>
     <description><![CDATA[Automatiza el cálculo de precios para combinaciones de productos cárnicos.]]></description>
     <author><![CDATA[josra]]></author>
     <tab><![CDATA[pricing_promotion]]></tab>
